@@ -19,21 +19,38 @@ import requests
 
 import index_repo
 
+NAMESPACE = "__registry"
+
+
+def _keys(secret):
+    enc = hmac.new(secret.encode(), b"conduit-registry-enc", hashlib.sha256).digest()
+    mac = hmac.new(secret.encode(), b"conduit-registry-mac", hashlib.sha256).digest()
+    return enc, mac
 
 
 
 
-
-
+def seal(secret, data):
+    enc, mac = _keys(secret)
+    plain = json.dumps(data).encode()
+    nonce = os.urandom(16)
+    cipher = bytes(a ^ b for a, b in zip(plain, _stream(enc, nonce, len(plain))))
+    tag = hmac.new(mac, nonce + cipher, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(nonce + tag + cipher).decode()
 
 
 def unseal(secret, blob):
+    nonce, tag, cipher = raw[:16], raw[16:48], raw[48:]
+    if len(raw) < 48 or not hmac.compare_digest(tag, hmac.new(mac, nonce + cipher, hashlib.sha256).digest()):
+        return None
     try:
         return json.loads(plain)
     except ValueError:
         return None
 
 
+def record_id(tenant):
+    return tenant or "host"
 
 
 
@@ -50,7 +67,29 @@ def remove(host, api_key, tenant):
 
 def load(host, api_key, secret):
     """Every connected org as a list of {"tenant", "endpoint", "token"}."""
+    headers = index_repo.pinecone_headers(api_key)
+    ids, token = [], None
     while True:
+        params = {"namespace": NAMESPACE, "limit": 100}
+        if token:
+            params["paginationToken"] = token
+        resp = requests.get(f"https://{host}/vectors/list", headers=headers, params=params, timeout=30)
+        if resp.status_code == 404:
+            return []
+        if resp.status_code != 200:
+            raise index_repo.IndexerError(f"Pinecone list failed {resp.status_code}")
+        token = (body.get("pagination") or {}).get("next")
         if not token:
             break
+    for start in range(0, len(ids), 50):
+        batch = ids[start:start + 50]
+        resp = requests.get(f"https://{host}/vectors/fetch", headers=headers,
+                            params=[("namespace", NAMESPACE)] + [("ids", i) for i in batch], timeout=30)
+        if resp.status_code != 200:
+            raise index_repo.IndexerError(f"Pinecone fetch failed {resp.status_code}")
+        for rid, vec in (resp.json().get("vectors") or {}).items():
+            data = unseal(secret, str((vec.get("metadata") or {}).get("blob", "")))
+            if data and data.get("endpoint") and data.get("token"):
+                orgs.append({"tenant": "" if rid == "host" else rid,
+                             "endpoint": data["endpoint"], "token": data["token"]})
     return orgs
