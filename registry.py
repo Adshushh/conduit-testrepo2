@@ -28,6 +28,13 @@ def _keys(secret):
     return enc, mac
 
 
+def _stream(key, nonce, length):
+    out = b""
+    counter = 0
+    while len(out) < length:
+        out += hmac.new(key, nonce + counter.to_bytes(4, "big"), hashlib.sha256).digest()
+        counter += 1
+    return out[:length]
 
 
 def seal(secret, data):
@@ -40,9 +47,15 @@ def seal(secret, data):
 
 
 def unseal(secret, blob):
+    enc, mac = _keys(secret)
+    try:
+        raw = base64.urlsafe_b64decode(blob.encode())
+    except (ValueError, TypeError):
+        return None
     nonce, tag, cipher = raw[:16], raw[16:48], raw[48:]
     if len(raw) < 48 or not hmac.compare_digest(tag, hmac.new(mac, nonce + cipher, hashlib.sha256).digest()):
         return None
+    plain = bytes(a ^ b for a, b in zip(cipher, _stream(enc, nonce, len(cipher))))
     try:
         return json.loads(plain)
     except ValueError:
@@ -53,6 +66,13 @@ def record_id(tenant):
     return tenant or "host"
 
 
+def save(host, api_key, secret, tenant, endpoint, token):
+    record = {
+        "_id": record_id(tenant),
+        index_repo.TEXT_FIELD: "conduit org",
+        "blob": seal(secret, {"endpoint": endpoint, "token": token}),
+    }
+    index_repo.upsert(host, api_key, NAMESPACE, [record])
 
 
 def remove(host, api_key, tenant):
@@ -78,9 +98,12 @@ def load(host, api_key, secret):
             return []
         if resp.status_code != 200:
             raise index_repo.IndexerError(f"Pinecone list failed {resp.status_code}")
+        body = resp.json()
+        ids += [v["id"] for v in body.get("vectors", []) if v.get("id")]
         token = (body.get("pagination") or {}).get("next")
         if not token:
             break
+    orgs = []
     for start in range(0, len(ids), 50):
         batch = ids[start:start + 50]
         resp = requests.get(f"https://{host}/vectors/fetch", headers=headers,
