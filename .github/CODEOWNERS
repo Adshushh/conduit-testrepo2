@@ -1,0 +1,5 @@
+# Conduit test bed owners
+/tests/ @harshathkh
+/repos.py @conduitcliq
+# team owners are ignored by Conduit
+/ci/ @Adshushh/devops
