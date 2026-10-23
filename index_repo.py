@@ -28,14 +28,29 @@ import time
 
 import requests
 
+PINECONE_API = "https://api.pinecone.io"
+PINECONE_VERSION = "2026-07"
+EMBED_MODEL = "multilingual-e5-large"
+TEXT_FIELD = "chunk_text"
 
+CHUNK_LINES = 40        # lines per chunk
+CHUNK_OVERLAP = 8       # lines shared between neighbouring chunks
+CHUNK_MAX_CHARS = 1500  # the embedding model reads roughly this much per chunk
+MAX_FILE_BYTES = 200_000
+BATCH_SIZE = 50
 # chunks collected before they are uploaded; keeps memory flat on big repos
+UPLOAD_EVERY = 500
+DOWNLOAD_PIECE = 1 << 20
 
 CODE_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".java", ".kt", ".go",
     ".rb", ".php", ".cs", ".c", ".h", ".cpp", ".hpp", ".rs", ".swift", ".dart",
     ".html", ".css", ".scss", ".vue", ".svelte", ".sql", ".sh", ".yml", ".yaml",
     ".toml", ".md", ".dg", ".prisma", ".graphql",
+}
+SKIP_DIRS = {
+    "node_modules", ".git", "dist", "build", "out", ".next", "vendor", "venv",
+    ".venv", "__pycache__", "coverage", "target", ".idea", ".vscode", "migrations",
 }
 SKIP_FILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock"}
 
@@ -87,6 +102,22 @@ def download_repo(repo, token, ref=None):
     The archive is saved to a temporary file in pieces and read back one file at a
     time, so a large repo never has to fit in memory.
     """
+    url = f"https://api.github.com/repos/{repo}/tarball"
+    if ref:
+        url += f"/{ref}"
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    with requests.get(url, headers=headers, timeout=180, stream=True) as resp:
+        if resp.status_code == 401:
+            raise IndexerError("GitHub rejected the token.")
+        if resp.status_code in (403, 404):
+            raise IndexerError(f"The token can't read {repo} (GitHub said {resp.status_code}).")
+        if resp.status_code != 200:
+            raise IndexerError(f"GitHub error {resp.status_code} for {repo}.")
+        archive_file = tempfile.TemporaryFile()
+        for piece in resp.iter_content(DOWNLOAD_PIECE):
+            archive_file.write(piece)
     archive_file.seek(0)
 
     with archive_file, tarfile.open(fileobj=archive_file, mode="r|gz") as archive:
@@ -108,6 +139,14 @@ def download_repo(repo, token, ref=None):
                 yield "/".join(parts), text
 
 
+def should_skip(parts):
+    filename = parts[-1]
+    if filename in SKIP_FILES or filename.endswith(".min.js") or filename.endswith(".min.css"):
+        return True
+    if any(part in SKIP_DIRS for part in parts[:-1]):
+        return True
+    extension = os.path.splitext(filename)[1].lower()
+    return extension not in CODE_EXTENSIONS
 
 
 def file_id(path):
@@ -142,6 +181,11 @@ def chunk_file(path, text):
         start += step
 
 
+def clear_namespace(host, api_key, namespace):
+    """Remove old chunks so deleted or renamed files don't linger."""
+    resp = requests.delete(f"https://{host}/namespaces/{namespace}",
+                           headers=pinecone_headers(api_key), timeout=60)
+    return resp.status_code in (200, 202, 204, 404)
 
 
 def upsert(host, api_key, namespace, records, progress=None):
@@ -164,6 +208,30 @@ def upsert(host, api_key, namespace, records, progress=None):
             progress(min(i + BATCH_SIZE, len(records)), len(records))
 
 
+def delete_file_chunks(host, api_key, namespace, path):
+    """Remove every chunk of one file from a namespace. Returns how many were removed."""
+    headers = pinecone_headers(api_key)
+    ids, token = [], None
+    while True:
+        params = {"namespace": namespace, "prefix": file_id(path) + "-", "limit": 100}
+        if token:
+            params["paginationToken"] = token
+        resp = requests.get(f"https://{host}/vectors/list", headers=headers, params=params, timeout=30)
+        if resp.status_code == 404:
+            return 0
+        if resp.status_code != 200:
+            raise IndexerError(f"Pinecone list failed {resp.status_code}")
+        body = resp.json()
+        ids += [v["id"] for v in body.get("vectors", []) if v.get("id")]
+        token = (body.get("pagination") or {}).get("next")
+        if not token:
+            break
+    for start in range(0, len(ids), 1000):
+        resp = requests.post(f"https://{host}/vectors/delete", headers=headers, timeout=30,
+                             json={"ids": ids[start:start + 1000], "namespace": namespace})
+        if resp.status_code not in (200, 202, 404):
+            raise IndexerError(f"Pinecone delete failed {resp.status_code}")
+    return len(ids)
 
 
 def fetch_file(repo, token, path, ref=None):
@@ -231,6 +299,16 @@ def namespace_count(host, api_key, namespace):
     return None
 
 
+def search(host, api_key, namespace, query, top_k=8):
+    body = {
+        "query": {"inputs": {"text": query}, "top_k": top_k},
+        "fields": ["path", "lines"],
+    }
+    resp = requests.post(f"https://{host}/records/namespaces/{namespace}/search",
+                         headers=pinecone_headers(api_key), json=body, timeout=60)
+    if resp.status_code != 200:
+        raise IndexerError(f"Pinecone search failed {resp.status_code}: {resp.text[:200]}")
+    return resp.json()["result"]["hits"]
 
 
 def build_records(repo, token, ref=None):
@@ -272,11 +350,29 @@ def run_index(repo, namespace, token, api_key, index_name="conduit", ref=None, p
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Index a GitHub repo for Conduit.")
+    parser.add_argument("--repo", help="owner/name, e.g. fastapi/full-stack-fastapi-template")
+    parser.add_argument("--namespace", required=True,
+                        help="namespace shown on the /repo card in Cliq")
+    parser.add_argument("--index", default=os.environ.get("PINECONE_INDEX", "conduit"),
+                        help="Pinecone index name (default: conduit)")
+    parser.add_argument("--ref", help="branch, tag or commit (default: default branch)")
+    parser.add_argument("--query", help="search the namespace instead of indexing")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="show what would be indexed, don't call Pinecone")
+    args = parser.parse_args()
 
+    api_key = os.environ.get("PINECONE_API_KEY")
     if not api_key and not args.dry_run:
         sys.exit("Set PINECONE_API_KEY first.")
 
     try:
+        if args.query:
+            host = ensure_index(api_key, args.index)
+            for hit in search(host, api_key, args.namespace, args.query):
+                fields = hit["fields"]
+                print(f"{hit['_score']:.3f}  {fields['path']}  (lines {fields['lines']})")
+            return
 
         if not args.repo:
             sys.exit("--repo is required when indexing.")
@@ -295,8 +391,13 @@ def main():
             elif stage == "upload" and total:
                 print(f"  uploaded {done}/{total} chunks")
 
+        files, chunks, host = run_index(args.repo, args.namespace, os.environ.get("GITHUB_TOKEN"),
+                                        api_key, args.index, args.ref, show)
+        print(f"\nDone: {files} files -> {chunks} chunks in namespace '{args.namespace}'.")
         print(f"Index host: {host}")
     except IndexerError as err:
         sys.exit(str(err))
 
 
+if __name__ == "__main__":
+    main()
